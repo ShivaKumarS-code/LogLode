@@ -1,0 +1,23 @@
+{
+  "name": "loglode",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local-first CLI wrapper that logs coding-agent token telemetry and mines recurring waste into micro-skills.",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "loglode": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

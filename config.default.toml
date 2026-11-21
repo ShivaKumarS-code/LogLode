@@ -1,0 +1,19 @@
+[adapter]
+default_cli = "claude_code"         # "claude_code" | "codex"
+injection_mode = "system_prompt"    # "system_prompt" | "managed_md_block"
+
+[budget]
+soft_alert_usd = 0.75               # terminal warning + desktop notification
+hard_stop_usd = 2.00                # pauses or sends SIGINT unless --no-kill
+max_single_turn_tokens = 25000      # flags runaway tool output immediately
+
+[loops]
+max_same_error_retries = 3          # fires alert on 3rd identical stderr fingerprint
+max_same_file_reads = 4             # flags context amnesia / re-read loops
+min_cache_hit_ratio = 0.50          # warns after turn 4 if prompt caching breaks
+
+[distiller]
+model = "claude-haiku-4-5"          # cheap synthesis model
+max_skill_file_tokens = 800         # hard ceiling for .loglode/micro-skills.md
+min_sessions_to_promote = 2
+min_single_session_waste = 8000
