@@ -66,6 +66,7 @@ import { openStateDb } from './store/db.js';
 import {
   countSessions,
   deactivateMicroSkill,
+  deleteWasteFindingsForSession,
   getRecentSessions,
   getSession,
   getWasteFindingsForRepo,
@@ -906,8 +907,16 @@ async function mineCommand(args: Extract<ParseResult, { kind: 'mine' }>, io: Cli
       printFindings(io, windows);
     }
 
-    if (!args.dryRun && findings.length > 0) {
-      insertWasteFindings(db, findings);
+    if (!args.dryRun) {
+      // Convergent re-mining: clear the window's stored rows first so repeating
+      // `mine` cannot duplicate earlier sessions' findings (§3 Stage 4). The
+      // dry-run path returns before this and must not mutate the store at all.
+      for (const windowSession of getRecentSessions(db, context.repoHash, windowSize)) {
+        deleteWasteFindingsForSession(db, context.repoHash, windowSession.id);
+      }
+      if (findings.length > 0) {
+        insertWasteFindings(db, findings);
+      }
     }
     const wasted = findings.reduce((sum, finding) => sum + finding.wastedTokens, 0);
     const persistence =

@@ -6,6 +6,7 @@ import { openMemoryDb, openStateDb } from './db.js';
 import {
   countSessions,
   deactivateMicroSkill,
+  deleteWasteFindingsForSession,
   finalizeSession,
   getRecentSessions,
   getSession,
@@ -324,6 +325,48 @@ describe('waste findings', () => {
         [10, 20],
       );
       assert.deepEqual(getWasteFindingsBySignature(db, REPO, 'missing'), []);
+    });
+  });
+
+  it('deleteWasteFindingsForSession removes only that session’s rows and returns the count', () => {
+    withDb((db) => {
+      insertSession(db, makeSession({ id: 'session-1' }));
+      insertSession(db, makeSession({ id: 'session-2' }));
+      insertWasteFindings(db, [
+        makeWasteFinding({ sessionId: 'session-1', signature: 'repeat_read:src/a.ts' }),
+        makeWasteFinding({ sessionId: 'session-1', signature: 'fail_loop:pytest' }),
+        makeWasteFinding({ sessionId: 'session-2', signature: 'repeat_read:src/b.ts' }),
+      ]);
+
+      assert.equal(deleteWasteFindingsForSession(db, REPO, 'session-1'), 2);
+      assert.deepEqual(
+        getWasteFindingsForRepo(db, REPO).map((finding) => [finding.sessionId, finding.signature]),
+        [['session-2', 'repeat_read:src/b.ts']],
+      );
+
+      // No rows left for that session, and an unknown session is also a no-op.
+      assert.equal(deleteWasteFindingsForSession(db, REPO, 'session-1'), 0);
+      assert.equal(deleteWasteFindingsForSession(db, REPO, 'never-recorded'), 0);
+      assert.equal(deleteWasteFindingsForSession(db, OTHER_REPO, 'session-2'), 0);
+    });
+  });
+
+  it('deleteWasteFindingsForSession is scoped by repo hash', () => {
+    withDb((db) => {
+      // The sessions table keys by id, so one row serves both repositories; the
+      // findings share the session id string and must only be deleted per repo.
+      insertSession(db, makeSession({ id: 'shared-session' }));
+      insertWasteFindings(db, [
+        makeWasteFinding({ repoHash: REPO, sessionId: 'shared-session', signature: 'ours' }),
+        makeWasteFinding({ repoHash: OTHER_REPO, sessionId: 'shared-session', signature: 'theirs' }),
+      ]);
+
+      assert.equal(deleteWasteFindingsForSession(db, REPO, 'shared-session'), 1);
+      assert.deepEqual(getWasteFindingsForRepo(db, REPO), []);
+      assert.deepEqual(
+        getWasteFindingsForRepo(db, OTHER_REPO).map((finding) => finding.signature),
+        ['theirs'],
+      );
     });
   });
 });

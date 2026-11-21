@@ -9,8 +9,9 @@ import { describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-import type { CliTool, MicroSkillRecord } from '../adapters/types.js';
+import type { CliTool, MicroSkillRecord, ToolCallRecord } from '../adapters/types.js';
 import { readManagedBlock } from '../adapters/codexCli.js';
+import { runCli } from '../cli.js';
 import { DEFAULT_CONFIG } from '../config.js';
 import { resolveRepoContext } from '../repo.js';
 import type { LoglodeDb } from '../store/db.js';
@@ -18,7 +19,12 @@ import { openStateDb } from '../store/db.js';
 import {
   getRecentSessions,
   getToolCallsForSessions,
+  getWasteFindingsBySignature,
+  getWasteFindingsForRepo,
   insertMicroSkill,
+  insertSession,
+  insertToolCall,
+  insertWasteFindings,
   listAllMicroSkills,
   listActiveMicroSkills,
 } from '../store/queries.js';
@@ -252,6 +258,65 @@ function skillRecord(repoHash: string, overrides: Partial<MicroSkillRecord> & { 
     updatedAt: '2026-01-01T00:00:00.000Z',
   };
   return { ...base, ...overrides };
+}
+
+/** Seed one completed session plus its tool calls, outside the pipeline. */
+function seedSessionWithCalls(
+  db: LoglodeDb,
+  repoHash: string,
+  sessionId: string,
+  startedAt: string,
+  toolCalls: ToolCallRecord[],
+): void {
+  insertSession(db, {
+    id: sessionId,
+    repoHash,
+    cliTool: 'claude_code',
+    taskPromptHash: null,
+    gitHeadStart: null,
+    skillVersionId: null,
+    status: 'completed',
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0,
+    startedAt,
+    endedAt: startedAt,
+  });
+  for (const call of toolCalls) {
+    insertToolCall(db, call);
+  }
+}
+
+/** A failed shell command; two of these with the same signature mine as `fail_loop`. */
+function failedBashCall(sessionId: string, turnIndex: number): ToolCallRecord {
+  return {
+    sessionId,
+    turnIndex,
+    toolName: 'bash',
+    targetPath: null,
+    commandSignature: 'pytest -q',
+    exitCode: 1,
+    outputTokens: 100,
+    errorFingerprint: null,
+    createdAt: '2020-01-01T00:00:00.000Z',
+  };
+}
+
+/** A repo-relative read, which the detector treats as a read (not an edit). */
+function readCall(sessionId: string, turnIndex: number, targetPath = 'src/app.ts'): ToolCallRecord {
+  return {
+    sessionId,
+    turnIndex,
+    toolName: 'read_file',
+    targetPath,
+    commandSignature: null,
+    exitCode: null,
+    outputTokens: 100,
+    errorFingerprint: null,
+    createdAt: '2020-01-01T00:00:00.000Z',
+  };
 }
 
 interface RunOptionsOverrides {
@@ -688,4 +753,148 @@ describe('runSession — Codex', () => {
       });
     },
   );
+});
+
+/* -------------------------------------------------------------------------- */
+/* Convergent re-mining (deduplicated waste_findings)                          */
+/* -------------------------------------------------------------------------- */
+
+describe('runSession — deduplicated re-mining', () => {
+  it(
+    'replaces a prior session’s findings instead of duplicating them',
+    { timeout: 60_000 },
+    async () => {
+      await withHarness('anthropic', async (harness) => {
+        await writeFile(harness.repo, 'src/app.ts', 'export function app(): string {\n  return "ok";\n}\n');
+        await commitAll(harness.repo, 'add app');
+
+        // A prior session with two identical failed commands: a `fail_loop` finding
+        // that every re-mining run will detect again.
+        const seededId = '99999999-aaaa-4aaa-8aaa-999999999999';
+        seedState(harness.home, harness.repoHash, (db) => {
+          seedSessionWithCalls(db, harness.repoHash, seededId, '2020-01-01T00:00:00.000Z', [
+            failedBashCall(seededId, 1),
+            failedBashCall(seededId, 2),
+          ]);
+        });
+
+        const first = await runFixtureSession(harness);
+        assert.equal(first.status, 'completed');
+        const afterFirst = readState(harness.home, harness.repoHash, (db) =>
+          getWasteFindingsForRepo(db, harness.repoHash),
+        );
+        assert.deepEqual(
+          afterFirst.map((finding) => [finding.sessionId, finding.signature]),
+          [[seededId, 'fail_loop:pytest -q']],
+        );
+
+        const second = await runFixtureSession(harness);
+        assert.equal(second.status, 'completed');
+        const afterSecond = readState(harness.home, harness.repoHash, (db) =>
+          getWasteFindingsForRepo(db, harness.repoHash),
+        );
+
+        // Idempotent: the second run replaces the seeded session's rows rather
+        // than appending another copy of the same detection output.
+        assert.equal(afterSecond.length, afterFirst.length, 're-mining must not grow the store');
+        assert.deepEqual(
+          afterSecond.map((finding) => [finding.sessionId, finding.signature, finding.wastedTokens]),
+          afterFirst.map((finding) => [finding.sessionId, finding.signature, finding.wastedTokens]),
+        );
+        const signatureRows = readState(harness.home, harness.repoHash, (db) =>
+          getWasteFindingsBySignature(db, harness.repoHash, 'fail_loop:pytest -q'),
+        );
+        assert.equal(signatureRows.length, 1);
+      });
+    },
+  );
+
+  it(
+    're-attaches a cross-session repeat_read finding to the newest reading session',
+    { timeout: 60_000 },
+    async () => {
+      await withHarness('anthropic', async (harness) => {
+        await writeFile(harness.repo, 'src/app.ts', 'export function app(): string {\n  return "ok";\n}\n');
+        await commitAll(harness.repo, 'add app');
+
+        // Two prior sessions that each read the same path. Together with a fixture
+        // run they cross the miner's 3-session threshold, so the finding is attached
+        // to that run's session and later must move to the next run's session.
+        const olderId = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
+        const middleId = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb';
+        seedState(harness.home, harness.repoHash, (db) => {
+          seedSessionWithCalls(db, harness.repoHash, olderId, '2020-01-01T00:00:00.000Z', [readCall(olderId, 1)]);
+          seedSessionWithCalls(db, harness.repoHash, middleId, '2020-01-02T00:00:00.000Z', [readCall(middleId, 1)]);
+        });
+
+        const first = await runFixtureSession(harness);
+        const afterFirst = readState(harness.home, harness.repoHash, (db) =>
+          getWasteFindingsBySignature(db, harness.repoHash, 'repeat_read:src/app.ts'),
+        );
+        assert.equal(afterFirst.length, 1);
+        assert.equal(afterFirst[0]?.sessionId, first.sessionId);
+
+        const second = await runFixtureSession(harness);
+        const afterSecond = readState(harness.home, harness.repoHash, (db) =>
+          getWasteFindingsBySignature(db, harness.repoHash, 'repeat_read:src/app.ts'),
+        );
+
+        // One row, now owned by the newest session: the stale row on the previous
+        // session was deleted as part of the window re-mining.
+        assert.equal(afterSecond.length, 1, 'the stale cross-session row must be replaced, not added to');
+        assert.equal(afterSecond[0]?.sessionId, second.sessionId);
+      });
+    },
+  );
+
+  it('mine --dry-run does not mutate the store at all', { timeout: 30_000 }, async () => {
+    await withHarness('anthropic', async (harness) => {
+      const seededId = 'cccccccc-3333-4333-8333-cccccccccccc';
+      const signature = 'fail_loop:pytest -q';
+      seedState(harness.home, harness.repoHash, (db) => {
+        seedSessionWithCalls(db, harness.repoHash, seededId, '2020-01-01T00:00:00.000Z', [
+          failedBashCall(seededId, 1),
+          failedBashCall(seededId, 2),
+        ]);
+        // A row a dry run must preserve byte-for-byte, even though re-mining the
+        // window detects the same signature (a deletion would erase it).
+        insertWasteFindings(db, [
+          {
+            repoHash: harness.repoHash,
+            sessionId: seededId,
+            patternType: 'fail_loop',
+            signature,
+            occurrences: 9,
+            wastedTokens: 9_999,
+            evidenceJson: '{"marker":"original"}',
+          },
+        ]);
+      });
+
+      const before = readState(harness.home, harness.repoHash, (db) =>
+        getWasteFindingsForRepo(db, harness.repoHash),
+      );
+      assert.equal(before.length, 1);
+
+      const out = capture();
+      const err = capture();
+      const code = await runCli(['mine', '--dry-run'], {
+        stdout: out.stream,
+        stderr: err.stream,
+        cwd: harness.repo,
+        env: { ...baseEnv(), LOGLODE_HOME: harness.home },
+        configPaths: {
+          globalConfigPath: join(harness.home, '.loglode', 'config.toml'),
+          repoConfigPath: join(harness.repo, '.loglode', 'config.toml'),
+        },
+      });
+
+      assert.equal(code, 0);
+      assert.match(out.text(), /dry run: not persisted/);
+      const after = readState(harness.home, harness.repoHash, (db) =>
+        getWasteFindingsForRepo(db, harness.repoHash),
+      );
+      assert.deepEqual(after, before, 'a dry run must neither insert nor delete findings');
+    });
+  });
 });

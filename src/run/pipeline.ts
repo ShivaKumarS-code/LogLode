@@ -88,7 +88,9 @@ import { openStateDb } from '../store/db.js';
 import {
   countSessions,
   deactivateMicroSkill,
+  deleteWasteFindingsForSession,
   finalizeSession,
+  getRecentSessions,
   insertSession,
   insertToolCall,
   insertWasteFindings,
@@ -742,6 +744,13 @@ export async function runSession(opts: RunSessionOptions): Promise<RunSessionRes
     const findings = mineWindow(db, opts.repoHash, { windowSize: MINING_WINDOW_SIZE }).flatMap(
       (entry) => entry.findings,
     );
+    // Convergent re-mining (§3 Stage 4 stores *deduplicated* findings): the window
+    // is re-detected from scratch on every run, so the window sessions' stored rows
+    // are cleared before the fresh set is inserted. Without this, findings for an
+    // earlier session would be duplicated on every `run`/`mine`.
+    for (const windowSession of getRecentSessions(db, opts.repoHash, MINING_WINDOW_SIZE)) {
+      deleteWasteFindingsForSession(db, opts.repoHash, windowSession.id);
+    }
     if (findings.length > 0) {
       insertWasteFindings(db, findings);
     }

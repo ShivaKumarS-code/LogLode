@@ -336,6 +336,26 @@ export function getWasteFindingsBySignature(
   return asRows(rows).map(mapWasteFinding);
 }
 
+/**
+ * Delete every waste finding recorded for one session and return the row count.
+ *
+ * Re-mining is convergent (§3 Stage 4: "Store deduplicated waste_findings"): a
+ * caller that re-runs the deterministic detectors over a window first clears the
+ * window sessions' rows and then inserts the fresh findings, so a session's
+ * stored rows always equal its current detection output. This is also how a
+ * cross-session `repeat_read` row is re-attached — the old owner's row is
+ * deleted when that owner next falls inside the window.
+ *
+ * Scoped by `repo_hash` as well as `session_id` so an identical id string under
+ * another repository can never be touched. `LoglodeDb.run()` returns void, so
+ * the count comes from `SELECT changes()` on the same handle (the same pattern
+ * used for `last_insert_rowid`), which SQLite reports per connection.
+ */
+export function deleteWasteFindingsForSession(db: LoglodeDb, repoHash: string, sessionId: string): number {
+  db.prepare('DELETE FROM waste_findings WHERE repo_hash = ? AND session_id = ?').run(repoHash, sessionId);
+  return toNumber(asRow(db.prepare('SELECT changes() AS deleted').get()).deleted);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Micro-skills                                                                */
 /* -------------------------------------------------------------------------- */
