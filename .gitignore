@@ -3,3 +3,4 @@ dist/
 *.tsbuildinfo
 .loglode/
 .DS_Store
+AGENTS.md
